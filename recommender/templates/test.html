@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="container">
+    <div class="row">
+      <div class="col-12">
+        <h1 class="mb-4">Resume Recommendation Test Tool</h1>
+        
+        <div class="card mb-4">
+          <div class="card-header bg-primary text-white">
+            <h4 class="mb-0">Test Form</h4>
+          </div>
+          <div class="card-body">
+            <form method="post">
+              {% csrf_token %}
+              <div class="mb-3">
+                <label class="form-label">Job Description:</label>
+                <textarea name="job_description" class="form-control" rows="6" placeholder="Paste a job description here..." required>{% if job_desc %}{{ job_desc }}{% endif %}</textarea>
+              </div>
+              <div class="row">
+                <div class="col-md-6">
+                  <div class="mb-3">
+                    <label class="form-label">Number of Results:</label>
+                    <input type="number" name="top_n" class="form-control" value="{{ top_n|default:5 }}" min="1" max="20">
+                  </div>
+                </div>
+                <div class="col-md-6">
+                  <div class="mb-3">
+                    <label class="form-label">Recommendation Method:</label>
+                    <select name="method" class="form-select">
+                      <option value="standard" {% if method == 'standard' %}selected{% endif %}>Standard NLP</option>
+                      <option value="llm" {% if method == 'llm' %}selected{% endif %}>LLM-based</option>
+                      <option value="hybrid" {% if method == 'hybrid' %}selected{% endif %}>Hybrid</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div class="d-grid">
+                <button type="submit" class="btn btn-primary">Get Recommendations</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        
+        {% if recommendations %}
+          <div class="card">
+            <div class="card-header bg-success text-white">
+              <h4 class="mb-0">Recommendation Results</h4>
+            </div>
+            <div class="card-body">
+              <div class="mb-3">
+                <strong>Job Description:</strong>
+                <p class="border p-2 bg-light">{{ job_desc }}</p>
+                <strong>Method:</strong> {{ method }}
+              </div>
+              
+              <div class="row">
+                {% for resume in recommendations %}
+                  <div class="col-md-6 mb-4">
+                    <div class="card h-100 shadow-sm">
+                      <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">{{ resume.name }}</h5>
+                        <span class="badge bg-primary">Score: {{ resume.score|floatformat:2 }}</span>
+                      </div>
+                      <div class="card-body">
+                        {% if resume.score_components %}
+                          <div class="mb-3">
+                            <strong>Score Components:</strong>
+                            <ul class="list-group list-group-flush">
+                              {% for component, value in resume.score_components.items %}
+                                <li class="list-group-item d-flex justify-content-between">
+                                  <span>{{ component|title }}</span>
+                                  <span>{{ value|floatformat:2 }}</span>
+                                </li>
+                              {% endfor %}
+                            </ul>
+                          </div>
+                        {% endif %}
+                        
+                        <div class="mb-3">
+                          <strong>Match Reasons:</strong>
+                          <ul class="list-group list-group-flush">
+                            {% for reason in resume.match_reasons %}
+                              <li class="list-group-item">{{ reason }}</li>
+                            {% endfor %}
+                          </ul>
+                        </div>
+                        
+                        <div class="mb-2">
+                          <strong>Skills:</strong>
+                          <div class="d-flex flex-wrap gap-1">
+                            {% for skill in resume.skills %}
+                              <span class="badge bg-info text-dark">{{ skill }}</span>
+                            {% endfor %}
+                          </div>
+                        </div>
+                        
+                        <div class="mb-2">
+                          <strong>Experience:</strong>
+                          <ul class="list-group list-group-flush mb-2">
+                            {% for exp in resume.experience %}
+                              <li class="list-group-item">
+                                <strong>{{ exp.position }}</strong> at {{ exp.company }}
+                                <br>
+                                <small class="text-muted">
+                                  {{ exp.start_date }} - {% if exp.end_date %}{{ exp.end_date }}{% else %}Present{% endif %}
+                                </small>
+                              </li>
+                            {% endfor %}
+                          </ul>
+                        </div>
+                        
+                        {% if resume.certifications %}
+                          <div class="mb-2">
+                            <strong>Certifications:</strong>
+                            <div class="d-flex flex-wrap gap-1">
+                              {% for cert in resume.certifications %}
+                                <span class="badge bg-success">{{ cert }}</span>
+                              {% endfor %}
+                            </div>
+                          </div>
+                        {% endif %}
+                        
+                        {% if resume.languages %}
+                          <div class="mb-2">
+                            <strong>Languages:</strong>
+                            <div class="d-flex flex-wrap gap-1">
+                              {% for lang in resume.languages %}
+                                <span class="badge bg-secondary">{{ lang }}</span>
+                              {% endfor %}
+                            </div>
+                          </div>
+                        {% endif %}
+                      </div>
+                    </div>
+                  </div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+{% endblock %}

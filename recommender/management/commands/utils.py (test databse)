@@ -1,0 +1,327 @@
+import json
+import numpy as np
+import spacy
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import defaultdict
+from functools import lru_cache
+import time
+import logging
+from django.core.cache import cache
+from multiprocessing import Pool
+from datetime import datetime
+from supabase import create_client
+from django.conf import settings
+import base64
+
+# Load models
+nlp = spacy.load("en_core_web_sm")
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Configuration - Adjust these weights based on importance
+WEIGHTS = {
+    'similarity': 0.4,
+    'experience': 0.25,
+    'skill_seniority': 0.15,
+    'keywords': 0.1,
+    'education': 0.05,
+    'languages': 0.03,
+    'certifications': 0.02
+}
+
+logger = logging.getLogger(__name__)
+
+# Initialize Supabase client
+supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+
+__all__ = ['load_resumes', 'enhance_resume_embedding', 'recommend_resumes']
+
+def enhance_resume_embedding(resume):
+    """Generate embedding text with contextual emphasis"""
+    sections = []
+    
+    # Education with institution context
+    education = []
+    for edu in resume.get('education', []):
+        institution = (edu.get('institution', '').strip() or 'Unknown Institution')
+        degree = edu.get('degree', '')
+        education.append(f"Studied {degree} at {institution}")
+    if education:
+        sections.append("Education Background: " + ". ".join(education))
+    
+    # Experience with role-specific context
+    experience = []
+    for exp in resume.get('experience', []):
+        company = exp.get('company', 'Unknown Company')
+        position = exp.get('position', '')
+        description = exp.get('description', '')
+        
+        # Extract technical keywords
+        tech_terms = " ".join([word for word in description.split() 
+                             if word.lower() in {'python', 'java', 'aws', 'sql'}])
+        
+        experience_entry = f"Worked as {position} at {company}"
+        if tech_terms:
+            experience_entry += f" with focus on {tech_terms}"
+        experience.append(experience_entry)
+    
+    if experience:
+        sections.append("Professional Experience: " + ". ".join(experience))
+    
+    # Skills and certifications with categorization
+    skills = resume.get('skills', [])
+    if skills:
+        sections.append("Technical Skills: " + ", ".join(skills))
+    
+    certs = resume.get('certifications', [])
+    if certs:
+        sections.append("Certifications Earned: " + ", ".join(certs))
+    
+    # Final embedding text
+    embedding_text = " ".join(sections)
+    
+    logger.debug(f"Enhanced embedding text: {embedding_text[:500]}...")
+    return embedding_text
+
+def load_resumes():
+    """Load resumes from Supabase with enhanced embedding text"""
+    try:
+        # Fetch resumes
+        resumes_response = supabase.table('resumes_duplicate').select('*').execute()
+        resumes = resumes_response.data
+
+        if not resumes:
+            logger.warning("No resumes found in resumes_duplicate table")
+            return []
+
+        # Add default values for test resumes
+        for resume in resumes:
+            resume['name'] = resume.get('name', 'Test Candidate')
+            resume['email'] = resume.get('email', 'test@example.com')
+            resume['phone'] = resume.get('phone', '000-0000')
+            resume['address'] = resume.get('address', 'Unknown')
+
+        # Decode Base64 embeddings
+        for resume in resumes:
+            if resume.get('embedding') and isinstance(resume['embedding'], str):
+                embedding_bytes = base64.b64decode(resume['embedding'])
+                resume['embedding'] = np.frombuffer(embedding_bytes, dtype='float32')
+            else:
+                logger.warning(f"Resume {resume.get('id')} has invalid/missing embedding")
+
+        # Ensure education is properly formatted
+        for resume in resumes:
+            # Convert education to list if it's a single object
+            if 'education' in resume and isinstance(resume['education'], dict):
+                resume['education'] = [resume['education']]
+            # Add empty array if education is missing
+            if 'education' not in resume:
+                resume['education'] = []
+
+        # Add embedding text to resumes
+        for resume in resumes:
+            resume['embedding_text'] = enhance_resume_embedding(resume)
+            
+        logger.debug(f"Loaded Resumes: {resumes[:1]}")  # Log first resume
+        return resumes
+    except Exception as e:
+        logger.error(f"Error loading resumes: {str(e)}")
+        return []
+
+def validate_resume(resume):
+    """Validate required resume fields"""
+    required_fields = ['skills', 'experience', 'education', 'user_id', 'embedding']
+    return all(field in resume for field in required_fields)
+
+def extract_job_requirements(job_desc):
+    """Advanced requirement extraction with tech stack analysis"""
+    doc = nlp(job_desc.lower())
+    
+    requirements = {
+        'tech_stack': defaultdict(lambda: {'years': 0, 'priority': 1}),
+        'required_skills': [],
+        'bonus_skills': [],
+        'experience_level': 'mid',
+        'responsibilities': []
+    }
+
+    # Pattern matching for experience requirements
+    for match in nlp(job_desc).ents:
+        if match.label_ == 'DATE' and 'year' in match.text:
+            # Find associated technology
+            for token in match.root.head.children:
+                if token.dep_ == 'prep' and token.text == 'in':
+                    tech = ' '.join([t.text for t in token.subtree if t.pos_ == 'NOUN'])
+                    if tech:
+                        requirements['tech_stack'][tech.lower()]['years'] = \
+                            int(''.join(filter(str.isdigit, match.text)))
+
+    # Detect skill levels and priorities
+    for sent in doc.sents:
+        if 'expert' in sent.text or 'senior' in sent.text:
+            requirements['experience_level'] = 'senior'
+        if 'junior' in sent.text or 'entry-level' in sent.text:
+            requirements['experience_level'] = 'junior'
+        
+        # Detect required skills with context
+        for chunk in sent.noun_chunks:
+            if 'experience' in chunk.text or 'skill' in chunk.text:
+                skill = chunk.text.replace('experience', '').replace('skill', '').strip()
+                if skill:
+                    requirements['required_skills'].append(skill)
+
+    # Detect bonus skills
+    for token in doc:
+        if token.text == 'plus' and doc[token.i+1].text == 'in':
+            requirements['bonus_skills'] = [t.text for t in doc[token.i+2].subtree if t.pos_ == 'NOUN']
+
+    return requirements
+
+def calculate_enhanced_score(resume, job_embedding, requirements):
+    """Advanced scoring with tech-specific experience evaluation"""
+    scores = defaultdict(float)
+    
+    # 1. Tech stack matching
+    tech_scores = []
+    for tech, req in requirements['tech_stack'].items():
+        tech_experience = 0
+        # Calculate experience duration for this specific tech
+        for exp in resume.get('experience', []):
+            if tech in ' '.join(exp.get('skills', [])).lower():
+                start = datetime.strptime(exp['start_date'], '%Y-%m-%d')
+                end = datetime.strptime(exp['end_date'], '%Y-%m-%d') if exp['end_date'] else datetime.now()
+                tech_experience += (end - start).days / 365
+                
+        # Calculate match quality
+        if tech_experience > 0:
+            match_ratio = min(tech_experience / req['years'], 2.0)  # Allow over-qualified
+            tech_scores.append(match_ratio * req['priority'])
+    
+    scores['tech_stack'] = sum(tech_scores) / len(tech_scores) if tech_scores else 0
+
+    # 2. Skill context analysis
+    skill_context_score = 0
+    resume_text = ' '.join([
+        f"{exp.get('position', '')} {exp.get('description', '')}" 
+        for exp in resume.get('experience', [])
+    ]).lower()
+    
+    for skill in requirements['required_skills']:
+        # Count occurrences in meaningful contexts
+        skill_count = sum(
+            1 for sentence in nlp(resume_text).sents 
+            if skill in sentence.text and any(
+                token.text in {'develop', 'build', 'lead', 'architect'} 
+                for token in sentence
+            )
+        )
+        skill_context_score += min(skill_count * 0.2, 1.0)
+    
+    scores['skill_context'] = skill_context_score / len(requirements['required_skills']) if requirements['required_skills'] else 0
+
+    # 3. Experience level matching
+    total_experience = sum(
+        (datetime.strptime(exp['end_date'], '%Y-%m-%d') - 
+         datetime.strptime(exp['start_date'], '%Y-%m-%d')).days / 365
+        for exp in resume.get('experience', [])
+    )
+    
+    level_multiplier = 1.0
+    if requirements['experience_level'] == 'senior' and total_experience >= 5:
+        level_multiplier = 1.5
+    elif requirements['experience_level'] == 'mid' and 3 <= total_experience < 5:
+        level_multiplier = 1.2
+    
+    # 4. Semantic similarity (existing)
+    scores['similarity'] = cosine_similarity([job_embedding], [resume['embedding']])[0][0]
+
+    # Updated weights
+    WEIGHTS = {
+        'tech_stack': 0.4,
+        'skill_context': 0.3,
+        'similarity': 0.2,
+        'experience_level': 0.1
+    }
+
+    return sum(WEIGHTS[k] * scores[k] for k in WEIGHTS)
+
+def get_job_embedding(job_desc):
+    cache_key = f"job_embedding_{hash(job_desc)}"
+    embedding = cache.get(cache_key)
+    
+    if not embedding:
+        embedding = model.encode(job_desc).tobytes()
+        cache.set(cache_key, embedding, timeout=3600)  # Cache for 1 hour
+    
+    logger.debug(f"Job Embedding Length: {len(embedding)}")
+    return np.frombuffer(embedding, dtype="float32")
+
+def score_resume(resume, job_embedding):
+    try:
+        logger.debug(f"Resume ID: {resume.get('user_id')}")
+        logger.debug(f"Embedding Type: {type(resume['embedding'])}")
+        logger.debug(f"Embedding Length: {len(resume['embedding'])}")
+        
+        # If embedding is stored as Base64, decode it
+        if isinstance(resume["embedding"], str):
+            embedding_bytes = base64.b64decode(resume["embedding"])
+        else:
+            embedding_bytes = resume["embedding"]
+
+        # Convert to NumPy array
+        resume_embedding = np.frombuffer(embedding_bytes, dtype="float32")
+        similarity = cosine_similarity([job_embedding], [resume_embedding])[0][0]
+        logger.debug(f"Similarity Score: {similarity}")
+        return resume, similarity
+    except Exception as e:
+        logger.error(f'Error scoring resume: {str(e)}')
+        return resume, 0
+
+def recommend_resumes(job_desc, resumes, top_n=5):
+    try:
+        # Generate job embedding using enhanced text
+        job_embedding = model.encode(job_desc).astype('float32')
+        
+        scores = []
+        for resume in resumes:
+            if resume.get('embedding') is not None and np.size(resume['embedding']) > 0:
+                # Use the precomputed enhanced embedding
+                resume_embedding = np.array(resume['embedding'], dtype='float32')
+                similarity = cosine_similarity([job_embedding], [resume_embedding])[0][0]
+                scores.append((resume, similarity))
+        
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_n]
+    except Exception as e:
+        logger.error(f"Error in recommendation: {str(e)}")
+        return []
+
+def preprocess_text(text):
+    """Clean and standardize text before embedding"""
+    doc = nlp(text.lower())
+    tokens = [token.text for token in doc 
+             if not token.is_stop and not token.is_punct]
+    return " ".join(tokens)
+
+def get_skill_similarity(resume_skills, job_skills):
+    """Calculate skill-specific similarity"""
+    resume_set = set(s.lower() for s in resume_skills)
+    job_set = set(s.lower() for s in job_skills)
+    if not job_set:
+        return 0
+    return len(resume_set.intersection(job_set)) / len(job_set)
+
+@lru_cache(maxsize=1000)
+def get_embedding(text):
+    """Cache embeddings for better performance"""
+    return model.encode([text])[0]
+
+def log_recommendation_metrics(job_desc, num_candidates, duration):
+    """Log recommendation performance metrics"""
+    logger.info({
+        'event': 'recommendation',
+        'candidates': num_candidates,
+        'duration': duration,
+        'desc_length': len(job_desc)
+    })
